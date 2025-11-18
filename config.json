@@ -1,0 +1,11 @@
+{
+  "open_palm": "media_play_pause",
+  "swipe_down": "win+d",
+  "swipe_up": "win+tab",
+  "palm_closing": "left_click",
+  "fist": "left_click",
+  "swipe_left": "media_previous",
+  "swipe_right": "media_next",
+  "palm_up": "volume up",
+  "palm_down": "volume down"
+}
