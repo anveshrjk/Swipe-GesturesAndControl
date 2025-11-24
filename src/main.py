@@ -1,7 +1,11 @@
-# File: src/main.py
-from ui import App
+# main.py
+from ui import SwipeApp
+
+def main():
+    """Entry point for the SWIPE Gesture Control system."""
+    app = SwipeApp()
+    app.mainloop()
+
 
 if __name__ == "__main__":
-    app = App()
-    app.protocol("WM_DELETE_WINDOW", app.on_closing)
-    app.mainloop()
+    main()

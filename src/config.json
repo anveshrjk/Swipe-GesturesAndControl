@@ -1,0 +1,22 @@
+{
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "device_index": 0,
+    "mirror_preview": true
+  },
+  "processing": {
+    "n_stable_frames": 3,
+    "cooldown_seconds": 0.7,
+    "pinch_threshold": 0.12,
+    "burst_steps": 2,
+    "burst_delay_ms": 80,
+    "taskview_timeout": 11,
+    "model_complexity": 1
+  },
+  "ui": {
+    "show_fps": true,
+    "sensitivity": "Medium",
+    "start_minimized": false
+  }
+}

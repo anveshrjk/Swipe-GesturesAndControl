@@ -1,49 +1,53 @@
-# File: src/camera.py
-# simple camera thread, small, fast.
-import cv2
 import threading
-import queue
 import time
+import cv2
+from queue import Queue, Empty
+
 
 class CameraThread(threading.Thread):
-    """captures frames in background quickly."""
-    def __init__(self, frame_queue: queue.Queue, camera_index=0, width=1280, height=720):
+    def __init__(self, frame_queue: Queue, stop_event: threading.Event, cfg: dict):
         super().__init__(daemon=True)
         self.frame_queue = frame_queue
-        self.camera_index = camera_index
-        self._stop = threading.Event()
-        self.cap = cv2.VideoCapture(self.camera_index)
-        if not self.cap.isOpened():
-            raise RuntimeError("Could not open webcam")
-        # set capture resolution (increase as requested)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.frame_count = 0
-        self.fps = 0
-        self.last_fps_time = time.time()
+        self.stop_event = stop_event
+
+        self.device_index = cfg.get("device_index", 0)
+        self.width = cfg.get("width", 1280)
+        self.height = cfg.get("height", 720)
+        self.mirror = cfg.get("mirror_preview", True)
+
+        self.cap = None
 
     def run(self):
-        while not self._stop.is_set():
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            # stable FPS counter per second
-            self.frame_count += 1
-            now = time.time()
-            if now - self.last_fps_time >= 1.0:
-                self.fps = self.frame_count
-                self.frame_count = 0
-                self.last_fps_time = now
-            # keep latest only
-            if self.frame_queue.qsize() > 1:
-                try:
-                    self.frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self.frame_queue.put((frame, self.fps))
+        self.cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
 
-    def stop(self):
-        self._stop.set()
-        time.sleep(0.05)
-        self.cap.release()
+        try:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        except Exception:
+            pass
+
+        while not self.stop_event.is_set():
+            ok, frame = self.cap.read()
+
+            if not ok:
+                time.sleep(0.05)
+                continue
+
+            if self.mirror:
+                frame = cv2.flip(frame, 1)
+
+            try:
+                if self.frame_queue.full():
+                    try:
+                        _ = self.frame_queue.get_nowait()
+                    except Exception:
+                        pass
+
+                self.frame_queue.put_nowait(frame)
+            except Exception:
+                pass
+
+        try:
+            self.cap.release()
+        except Exception:
+            pass
