@@ -1,0 +1,19 @@
+{
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "device_index": 0,
+    "mirror_preview": true,
+    "target_fps": 30
+  },
+  "processing": {
+    "stable_frames_required": 4,
+    "open_palm_hold_seconds": 1.0,
+    "command_mode_max_duration": 5.0,
+    "model_complexity": 0
+  },
+  "ui": {
+    "start_minimized": false,
+    "show_overlay": true
+  }
+}

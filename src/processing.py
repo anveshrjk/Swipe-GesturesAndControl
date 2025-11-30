@@ -1,174 +1,214 @@
-# File: src/processing.py
-# mediaPipe processing, gestures detection, and triggering actions via mapper.
+# processing.py
+"""
+Simple processing thread: detects gestures and performs actions
+"""
+
 import threading
-import queue
-import cv2
 import time
-import numpy as np
-import sys
-import os
-import contextlib
-from collections import deque
+import cv2
+from queue import Empty
+import utils
+import gestures
+import actions
 
-# silence C++ stderr for mediapipe imports
-@contextlib.contextmanager
-def suppress_stderr():
-    with open(os.devnull, "w") as devnull:
-        old = sys.stderr
-        sys.stderr = devnull
-        try:
-            yield
-        finally:
-            sys.stderr = old
+logger = utils.get_logger("processing")
 
-with suppress_stderr():
+try:
     import mediapipe as mp
+    MP_AVAILABLE = True
+except Exception:
+    MP_AVAILABLE = False
+    logger.warning("MediaPipe not available")
 
 class ProcessingThread(threading.Thread):
-    """runs MediaPipe hands, classifies gestures, calls mapper."""
-    def __init__(self, frame_queue: queue.Queue, results_queue: queue.Queue, mapper, preview_size=(960,540)):
+    def __init__(self, frame_q, preview_q, event_q, stop_event, cfg):
         super().__init__(daemon=True)
-        self.frame_queue = frame_queue
-        self.results_queue = results_queue
-        self.mapper = mapper
-        self._stop = False
-
-        # settings adjustable from UI
-        self.gesture_enabled = True
-        self.swipe_sensitivity = 60  # px threshold for horizontal swipe
-        self.swipe_vertical_sensitivity = 40  # px for vertical swipe
-        self.swipe_history_len = 6
-        self.cooldown_sec = 0.7
-
-        # centroid history for velocity
-        self.centroids = deque(maxlen=self.swipe_history_len)
-        self.last_action_time = 0
-
-        # palm_closing params
-        self.close_threshold = 40  # distance threshold in px
-
-        # mediapipe init
-        with suppress_stderr():
+        self.frame_q = frame_q
+        self.preview_q = preview_q
+        self.event_q = event_q
+        self.stop_event = stop_event
+        self.cfg = cfg or {}
+        
+        # Gesture detection settings
+        self.gesture_hold_time = 0.25  # Hold time for most gestures
+        self.ok_hold_time = 0.2  # Slightly shorter for OK gesture
+        self.v_hold_time = 0.2  # Short for V gesture
+        self.action_cooldown = 0.6  # Cooldown between actions
+        self.volume_interval = 0.3  # Volume adjustment interval
+        self.volume_hold_time = 0.3  # Hold time before volume starts adjusting
+        
+        # State tracking
+        self.current_gesture = None
+        self.displayed_gesture = None  # Gesture to display (immediate)
+        self.gesture_start_time = None
+        self.last_action_time = {}
+        self.last_volume_action_time = 0
+        self.gesture_stability_count = 0  # Count consecutive detections for stability
+        
+        # MediaPipe setup
+        if MP_AVAILABLE:
             self.mp_hands = mp.solutions.hands
             self.hands = self.mp_hands.Hands(
+                static_image_mode=False,
                 max_num_hands=1,
-                min_detection_confidence=0.6,
-                min_tracking_confidence=0.5
+                min_detection_confidence=0.7,
+                min_tracking_confidence=0.7
             )
-            self.mp_draw = mp.solutions.drawing_utils
-
-        self.preview_w, self.preview_h = preview_size
-
-    def stop(self):
-        self._stop = True
-
-    # finger classification simple
-    def classify_fingers(self, lm):
-        fingers = []
-        # thumb: compare x of tip and ip (index 3)
-        fingers.append(1 if lm[4][0] > lm[3][0] else 0)
-        for t in (8,12,16,20):
-            fingers.append(1 if lm[t][1] < lm[t-2][1] else 0)
-        s = sum(fingers)
-        if s >= 4: return "open_palm"
-        if s <= 1: return "fist"
-        return "unknown"
-
-    # palm up/down by comparing middle tip y to wrist y
-    def palm_orientation(self, lm):
-        wrist_y = lm[0][1]
-        middle_tip_y = lm[12][1]
-        return "palm_up" if middle_tip_y < wrist_y else "palm_down"
-
-    # palm_closing: average fingertip distance to wrist small -> closing
-    def palm_closing(self, lm):
-        wrist = lm[0]
-        tips = [lm[i] for i in (4,8,12,16,20)]
-        dists = [np.hypot(t[0]-wrist[0], t[1]-wrist[1]) for t in tips]
-        avg = sum(dists)/len(dists)
-        return avg < self.close_threshold
-
-    # detect horizontal/vertical swipes
-    def detect_swipe(self, cx, cy):
-        self.centroids.append((cx, cy))
-        if len(self.centroids) < self.centroids.maxlen:
-            return None
-        dx = self.centroids[-1][0] - self.centroids[0][0]
-        dy = self.centroids[-1][1] - self.centroids[0][1]
-        if abs(dx) > self.swipe_sensitivity and abs(dx) > abs(dy):
-            return "swipe_right" if dx > 0 else "swipe_left"
-        if abs(dy) > self.swipe_vertical_sensitivity and abs(dy) > abs(dx):
-            return "swipe_down" if dy > 0 else "swipe_up"
-        return None
-
-    def trigger_action(self, gesture):
-        if not self.gesture_enabled:
+            self.drawer = mp.solutions.drawing_utils
+            self.drawing_styles = mp.solutions.drawing_styles
+        else:
+            self.hands = None
+            self.drawer = None
+            self.mp_hands = None
+            self.drawing_styles = None
+    
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                frame = self.frame_q.get(timeout=0.5)
+            except Empty:
+                continue
+            
+            annotated = frame.copy()
+            detected_gesture = None
+            
+            # Process frame with MediaPipe
+            if self.hands:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = self.hands.process(rgb)
+                
+                if results.multi_hand_landmarks:
+                    hand_landmarks = results.multi_hand_landmarks[0]
+                    
+                    # Draw hand landmarks
+                    self.drawer.draw_landmarks(
+                        annotated,
+                        hand_landmarks,
+                        self.mp_hands.HAND_CONNECTIONS,
+                        self.drawing_styles.get_default_hand_landmarks_style(),
+                        self.drawing_styles.get_default_hand_connections_style()
+                    )
+                    
+                    # Detect gesture
+                    detected_gesture = gestures.detect_gesture(hand_landmarks.landmark)
+            
+            # Handle gesture state and actions
+            now = time.time()
+            self._handle_gesture(detected_gesture, now)
+            
+            # Draw detected gesture on frame immediately (don't wait for hold time)
+            gesture_to_display = self.displayed_gesture or detected_gesture
+            if gesture_to_display:
+                text = gesture_to_display.upper().replace('_', ' ')
+                # Show gesture text prominently
+                cv2.putText(annotated, text, (30, 90), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 255, 0), 4, cv2.LINE_AA)
+            
+            # Send annotated frame to UI
+            try:
+                self.preview_q.get_nowait()
+            except Exception:
+                pass
+            try:
+                self.preview_q.put_nowait(annotated)
+            except Exception:
+                pass
+    
+    def _handle_gesture(self, gesture, now):
+        """Handle gesture detection and trigger actions"""
+        
+        # Update displayed gesture immediately for visual feedback
+        if gesture:
+            self.displayed_gesture = gesture
+            
+            # Track gesture stability
+            if gesture == self.current_gesture:
+                self.gesture_stability_count += 1
+            else:
+                # New gesture detected
+                self.gesture_stability_count = 1
+                self.current_gesture = gesture
+                self.gesture_start_time = now
+        else:
+            # No gesture detected - clear after brief delay
+            if self.displayed_gesture:
+                if self.gesture_start_time is not None and (now - self.gesture_start_time) > 0.15:
+                    self.displayed_gesture = None
+                elif self.gesture_start_time is None:
+                    self.displayed_gesture = None
+            self.current_gesture = None
+            self.gesture_start_time = None
+            self.gesture_stability_count = 0
             return
-        now = time.time()
-        if now - self.last_action_time < self.cooldown_sec:
+        
+        # Only process actions if gesture is stable (detected at least 2 frames)
+        if self.gesture_stability_count < 2:
             return
-        # use mapper to execute action
+        
+        # If same gesture continues, check if we should trigger action
+        if gesture == self.current_gesture and self.gesture_start_time is not None:
+            hold_duration = now - self.gesture_start_time
+            
+            # Use appropriate hold time for each gesture
+            if gesture == 'ok':
+                required_hold = self.ok_hold_time
+            elif gesture == 'v':
+                required_hold = self.v_hold_time
+            elif gesture in ['fingers_up', 'fingers_down']:
+                required_hold = self.volume_hold_time
+            else:
+                required_hold = self.gesture_hold_time
+            
+            if hold_duration >= required_hold:
+                # Gesture held long enough, perform action
+                self._perform_action(gesture, now)
+    
+    def _perform_action(self, gesture, now):
+        """Perform the action for the detected gesture"""
+        
+        # Check cooldown for one-time actions
+        if gesture in ['ok', 'v', 'shaka', 'yo']:
+            last_time = self.last_action_time.get(gesture, 0)
+            if now - last_time < self.action_cooldown:
+                return  # Still in cooldown
+            
+            if gesture == 'ok':
+                actions.play_pause()
+                self._push_event('play_pause')
+            elif gesture == 'v':
+                actions.close_window()
+                self._push_event('close_window')
+            elif gesture == 'shaka':
+                filepath = actions.take_screenshot()
+                self._push_event('screenshot', filepath)
+            elif gesture == 'yo':
+                actions.launch_app()
+                self._push_event('launch_app')
+            
+            self.last_action_time[gesture] = now
+            self.gesture_start_time = None  # Reset to require new hold
+        
+        # Volume controls work continuously while gesture is held
+        elif gesture in ['fingers_up', 'fingers_down']:
+            # Only adjust if gesture has been held for required time
+            hold_duration = now - self.gesture_start_time if self.gesture_start_time else 0
+            if hold_duration >= self.volume_hold_time:
+                # Adjust volume at intervals
+                if now - self.last_volume_action_time >= self.volume_interval:
+                    if gesture == 'fingers_up':
+                        actions.volume_up()
+                        self._push_event('volume_up')
+                    elif gesture == 'fingers_down':
+                        actions.volume_down()
+                        self._push_event('volume_down')
+                    self.last_volume_action_time = now
+    
+    def _push_event(self, name, data=None):
+        """Push event to event queue"""
         try:
-            self.mapper.execute_action(gesture)
+            event = {"name": name, "time": time.time()}
+            if data is not None:
+                event["data"] = data
+            self.event_q.put_nowait(event)
         except Exception:
             pass
-        self.last_action_time = now
-
-    def run(self):
-        while not self._stop:
-            try:
-                frame, fps = self.frame_queue.get(timeout=0.02)
-            except queue.Empty:
-                continue
-
-            # flip first to draw text correctly
-            frame = cv2.flip(frame, 1)
-            h, w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            with suppress_stderr():
-                results = self.hands.process(rgb)
-
-            annotated = frame.copy()
-            gesture = "none"
-
-            if results.multi_hand_landmarks:
-                for handLms in results.multi_hand_landmarks:
-                    self.mp_draw.draw_landmarks(annotated, handLms, self.mp_hands.HAND_CONNECTIONS)
-                    # landmarks to absolute px
-                    lm = [(int(l.x * w), int(l.y * h)) for l in handLms.landmark]
-                    # centroid
-                    xs = [p[0] for p in lm]
-                    ys = [p[1] for p in lm]
-                    cx, cy = int(sum(xs)/len(xs)), int(sum(ys)/len(ys))
-
-                    # detection steps
-                    base = self.classify_fingers(lm)
-                    orient = self.palm_orientation(lm)
-                    closing = self.palm_closing(lm)
-                    swipe = self.detect_swipe(cx, cy)
-
-                    if swipe:
-                        gesture = swipe
-                    elif closing:
-                        gesture = "palm_closing"
-                    elif base in ("open_palm","fist"):
-                        gesture = base
-                    else:
-                        gesture = orient
-
-                    # draw bbox + gesture text (top-left) for debugging
-                    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-                    cv2.rectangle(annotated, (x1,y1), (x2,y2), (255,0,0), 2)
-                    cv2.putText(annotated, f"{gesture}", (10,30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,255), 2)
-
-                    # trigger mapped action
-                    self.trigger_action(gesture)
-
-            # push latest result only
-            if self.results_queue.qsize() > 1:
-                try:
-                    self.results_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self.results_queue.put((annotated, fps, gesture))

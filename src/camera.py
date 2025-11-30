@@ -1,49 +1,79 @@
-# File: src/camera.py
-# simple camera thread, small, fast.
-import cv2
+# camera.py
+# High-res camera capture (HD 1280x720) with frame throttling to ~30 FPS.
+
 import threading
-import queue
+import cv2
 import time
+from queue import Full
 
 class CameraThread(threading.Thread):
-    """captures frames in background quickly."""
-    def __init__(self, frame_queue: queue.Queue, camera_index=0, width=1280, height=720):
+    def __init__(self, frame_q, stop_event, cfg):
         super().__init__(daemon=True)
-        self.frame_queue = frame_queue
-        self.camera_index = camera_index
-        self._stop = threading.Event()
-        self.cap = cv2.VideoCapture(self.camera_index)
-        if not self.cap.isOpened():
-            raise RuntimeError("Could not open webcam")
-        # set capture resolution (increase as requested)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.frame_count = 0
-        self.fps = 0
-        self.last_fps_time = time.time()
+        self.frame_q = frame_q
+        self.stop_event = stop_event
+        self.cfg = cfg or {}
+        # Force HD
+        self.width = int(self.cfg.get("hd", {}).get("width", 1280))
+        self.height = int(self.cfg.get("hd", {}).get("height", 720))
+        self.target_fps = int(self.cfg.get("target_fps", 30))
+        self.mirror = bool(self.cfg.get("mirror_preview", True))
+        self.cap = None
 
     def run(self):
-        while not self._stop.is_set():
+        # Prefer DirectShow on Windows for stability:
+        try:
+            self.cap = cv2.VideoCapture(self.cfg.get("device_index", 0), cv2.CAP_DSHOW)
+        except Exception:
+            self.cap = cv2.VideoCapture(self.cfg.get("device_index", 0))
+
+        # Request HD and target fps (some cameras accept)
+        try:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            self.cap.set(cv2.CAP_PROP_FPS, float(self.target_fps))
+        except Exception:
+            pass
+
+        target_interval = 1.0 / max(1, self.target_fps)
+
+        while not self.stop_event.is_set():
+            t0 = time.time()
             ret, frame = self.cap.read()
-            if not ret:
+            if not ret or frame is None:
+                # small sleep instead of tight spinning
                 time.sleep(0.01)
                 continue
-            # stable FPS counter per second
-            self.frame_count += 1
-            now = time.time()
-            if now - self.last_fps_time >= 1.0:
-                self.fps = self.frame_count
-                self.frame_count = 0
-                self.last_fps_time = now
-            # keep latest only
-            if self.frame_queue.qsize() > 1:
-                try:
-                    self.frame_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self.frame_queue.put((frame, self.fps))
 
-    def stop(self):
-        self._stop.set()
-        time.sleep(0.05)
-        self.cap.release()
+            # Mirror for natural interaction
+            if self.mirror:
+                frame = cv2.flip(frame, 1)
+
+            # Ensure correct resolution
+            try:
+                h, w = frame.shape[:2]
+                if (w != self.width) or (h != self.height):
+                    frame = cv2.resize(frame, (self.width, self.height), interpolation=cv2.INTER_AREA)
+            except Exception:
+                pass
+
+            # keep only latest frame in queue
+            try:
+                while True:
+                    self.frame_q.get_nowait()
+            except Exception:
+                pass
+
+            try:
+                self.frame_q.put_nowait(frame)
+            except Full:
+                pass
+
+            elapsed = time.time() - t0
+            sleep_for = target_interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+        try:
+            self.cap.release()
+        except Exception:
+            pass
