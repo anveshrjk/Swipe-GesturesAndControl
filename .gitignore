@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+logs/
+screenshots/
+gesture_samples/
+*.log
+dist/
+build/
+*.spec
+*.exe
+*.dll
+*.pyd
