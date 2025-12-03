@@ -58,7 +58,7 @@ def play_pause():
     try:
         pyautogui.press("playpause")
     except Exception:
-        pyautogui.press("space")
+        pyautogui.press("ctrl+p")
 
 def close_window():
     """Close active window by clicking X button"""
